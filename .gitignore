@@ -1,0 +1,3 @@
+/.agent/workflows/
+__pycache__/
+*.pyc
