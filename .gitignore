@@ -18,6 +18,8 @@ build/
 .agent/
 docs/
 *.txt
+*.docx
+claim_task.js
 
 # SSL certs (auto-generated)
 /tmp/*.pem
