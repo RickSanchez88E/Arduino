@@ -1,2 +1,27 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.vscode/
+.idea/
+
+# Project-specific exclusions
+.agent/
+docs/
+*.txt
+
+# SSL certs (auto-generated)
+/tmp/*.pem
+
+# Compiled
+*.o
+*.hex
