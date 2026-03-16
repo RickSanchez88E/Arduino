@@ -54,6 +54,7 @@ ANCHOR_POSITIONS = {
 }
 
 ROBOT_MARKER_ID = 10
+VALID_IDS = set(ANCHOR_POSITIONS.keys()) | {ROBOT_MARKER_ID}  # {0,1,2,3,10}
 
 # -- Navigation parameters --
 ARRIVE_TOLERANCE   = 0.10   # 10cm - stop when this close to target
@@ -210,6 +211,8 @@ class VisionSystem:
         self.aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
         self.aruco_params = aruco.DetectorParameters() if hasattr(aruco, 'DetectorParameters') else aruco.DetectorParameters_create()
         self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        self.aruco_params.cornerRefinementMaxIterations = 50
+        self.aruco_params.minMarkerPerimeterRate = 0.05   # Reject tiny false positives
         self.detector = aruco.ArucoDetector(self.aruco_dict, self.aruco_params) if hasattr(aruco, 'ArucoDetector') else None
 
         # FPS counter
@@ -243,7 +246,16 @@ class VisionSystem:
                   "arena": {"w": ARENA_WIDTH, "h": ARENA_HEIGHT}}
 
         if ids is not None and len(ids) > 0:
+            # Filter out unknown IDs (reject false positives like ID:37)
             idf = ids.flatten()
+            valid_mask = np.isin(idf, list(VALID_IDS))
+            if not np.any(valid_mask):
+                ids = None
+                corners = []
+            else:
+                ids = ids[valid_mask]
+                corners = [corners[i] for i in range(len(valid_mask)) if valid_mask[i]]
+                idf = ids.flatten()
 
             for i, mid in enumerate(idf):
                 c = corners[i][0]
@@ -554,7 +566,7 @@ try{{
 const stream=await navigator.mediaDevices.getUserMedia({{
 video:{{facingMode:{{ideal:"environment"}},width:{{ideal:1920}},height:{{ideal:1080}}}},audio:false}});
 v.srcObject=stream; await v.play();
-sc.width=800; sc.height=Math.round(800*v.videoHeight/v.videoWidth);
+sc.width=480; sc.height=Math.round(480*v.videoHeight/v.videoWidth);
 function resizeOverlay(){{oc.width=v.clientWidth;oc.height=v.clientHeight}}
 resizeOverlay(); window.addEventListener("resize",resizeOverlay);
 hud.textContent="STREAMING";hud.className="ok";
@@ -576,7 +588,7 @@ drawOverlay(data);
 fc++;const now=Date.now();
 if(now-lt>=1000){{stats.textContent=Math.round(fc/((now-lt)/1000))+" FPS";fc=0;lt=now}}
 }}catch(e){{}}
-setTimeout(sendLoop,80);
+setTimeout(sendLoop,100);
 }},"image/jpeg",0.75);
 }}
 
