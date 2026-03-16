@@ -1,5 +1,5 @@
 """
-FYP Ground Control Station — Robot Navigation Monitor
+FYP Ground Control Station -- Robot Navigation Monitor
 Telemetry protocol: {T:posX,posY,theta,angleErr,target_v,target_w,goalX,goalY}
 Command protocol:   {GOAL:x,y}  |  {ZERO}  |  {SPIN}  |  {Heartbeat}
 Cal response:       {CAL:actual_rad}
@@ -11,6 +11,15 @@ import socket
 import threading
 import time
 import math
+import os
+import sys
+
+# Import ArUco tracker from same directory
+try:
+    from aruco_tracker import ArucoLocalization
+    ARUCO_AVAILABLE = True
+except ImportError:
+    ARUCO_AVAILABLE = False
 
 
 ROBOT_IP     = "192.168.4.1"
@@ -30,7 +39,12 @@ RED    = "#f38ba8"
 ORANGE = "#fab387"
 PURPLE = "#cba6f7"
 YELLOW = "#f9e2af"
-# ────────────────────────────────────────────────────────────────
+TEAL   = "#94e2d5"
+# Coordinate source options
+SRC_ENCODER = "Encoder"
+SRC_VISION  = "Vision"
+SRC_FUSED   = "Fused"
+# ----------------------------------------------------------------
 
 
 def _btn(parent, text, cmd, color=BLUE):
@@ -76,8 +90,18 @@ class RobotGCS:
         self.curr_theta = 0.0
         self.angle_err  = 0.0
 
+        # -- Vision system state --
+        self.vision_tracker = None
+        self.vision_enabled = False
+        self.coord_source   = SRC_ENCODER
+        self.vision_x = 0.0
+        self.vision_y = 0.0
+        self.vision_theta = 0.0
+        self.vision_valid = False
+
         self._build_ui()
         self.root.after(50, self._compass_tick)
+        self.root.after(200, self._vision_poll)
 
     # ------------------------------------------------------------------
     # UI Construction
@@ -156,10 +180,40 @@ class RobotGCS:
         _btn(sidebar, "■  STOP (hold position)", self.stop_robot, color=RED).pack(
             fill=tk.X, padx=16, pady=1)
 
-        # ── Calibration ──────────────────────────────────────────
+        # -- Vision System ----------------------------------------
+        _section(sidebar, "VISION SYSTEM")
+
+        vision_row = tk.Frame(sidebar, bg=PANEL)
+        vision_row.pack(fill=tk.X, padx=16, pady=4)
+
+        self.btn_vision = _btn(vision_row, "EYE  VISION OFF",
+                               self.toggle_vision, color=MUTED)
+        self.btn_vision.pack(fill=tk.X)
+
+        # Coordinate source selector
+        src_row = tk.Frame(sidebar, bg=PANEL)
+        src_row.pack(fill=tk.X, padx=16, pady=4)
+        tk.Label(src_row, text="Source:", bg=PANEL, fg=MUTED,
+                 font=("Arial", 9)).pack(side=tk.LEFT, padx=(0, 6))
+        self.coord_var = tk.StringVar(value=SRC_ENCODER)
+        for src in (SRC_ENCODER, SRC_VISION, SRC_FUSED):
+            rb = tk.Radiobutton(src_row, text=src, variable=self.coord_var,
+                                value=src, bg=PANEL, fg=TXT,
+                                selectcolor=CARD, activebackground=PANEL,
+                                font=("Arial", 8),
+                                command=self._on_source_change)
+            rb.pack(side=tk.LEFT, padx=2)
+
+        self.vision_status = tk.Label(
+            sidebar, text="Vision: offline",
+            font=("Courier", 9), bg=PANEL, fg=MUTED,
+            justify=tk.LEFT, wraplength=230, anchor="w")
+        self.vision_status.pack(fill=tk.X, padx=20, pady=2)
+
+        # -- Calibration ------------------------------------------
         _section(sidebar, "WHEELBASE CALIBRATION")
 
-        _btn(sidebar, "⟳  START SPIN CAL", self.start_spin_cal,
+        _btn(sidebar, "SPIN  START SPIN CAL", self.start_spin_cal,
              color=PURPLE).pack(fill=tk.X, padx=16, pady=8)
 
         self.cal_status = tk.Label(
@@ -454,10 +508,91 @@ class RobotGCS:
                                 fill=GREEN, width=2, arrow=tk.LAST,
                                 tags="robot_arrow")
 
-        # NOTE: Sonar / obstacle sensor rays will be drawn here once
-        # ultrasonic sensor data is added to the Arduino telemetry.
-        # Expected future protocol:
-        #   {T:posX,posY,theta,angleErr,target_v,target_w,goalX,goalY,d_L,d_M,d_R}
+        # Draw vision pose if available (purple overlay)
+        if self.vision_enabled and self.vision_valid:
+            vx_p = self.offX + self.vision_x * self.scale
+            vy_p = self.offY - self.vision_y * self.scale
+            self.canvas.create_oval(vx_p - 2, vy_p - 2, vx_p + 2, vy_p + 2,
+                                    fill=PURPLE, outline="", tags="vision_traj")
+            # Vision heading arrow (purple)
+            self.canvas.delete("vision_arrow")
+            va = 22
+            vax = vx_p + va * math.cos(self.vision_theta)
+            vay = vy_p - va * math.sin(self.vision_theta)
+            self.canvas.create_line(vx_p, vy_p, vax, vay,
+                                    fill=PURPLE, width=2, arrow=tk.LAST,
+                                    tags="vision_arrow")
+
+
+    # ------------------------------------------------------------------
+    # Vision System
+    # ------------------------------------------------------------------
+
+    def toggle_vision(self):
+        """Toggle ArUco vision system on/off."""
+        if not ARUCO_AVAILABLE:
+            messagebox.showerror("Vision Unavailable",
+                "ArUco tracker module not found.\n\n"
+                "Make sure aruco_tracker.py is in the same directory\n"
+                "and opencv-contrib-python is installed.")
+            return
+
+        if self.vision_enabled:
+            # Turn off
+            self.vision_enabled = False
+            if self.vision_tracker:
+                self.vision_tracker.stop()
+                self.vision_tracker = None
+            self.btn_vision.winfo_children()[0].config(
+                text="EYE  VISION OFF", fg=MUTED)
+            self.btn_vision.config(bg=MUTED)
+            self.vision_status.config(text="Vision: offline", fg=MUTED)
+            self.canvas.delete("vision_traj")
+            self.canvas.delete("vision_arrow")
+        else:
+            # Turn on
+            try:
+                self.vision_tracker = ArucoLocalization(camera_id=0)
+                if not self.vision_tracker.start():
+                    messagebox.showerror("Vision Error",
+                        "Cannot open camera.\n\n"
+                        "Check camera permissions and availability.")
+                    self.vision_tracker = None
+                    return
+                self.vision_enabled = True
+                self.btn_vision.winfo_children()[0].config(
+                    text="EYE  VISION ON", fg=GREEN)
+                self.btn_vision.config(bg=GREEN)
+                self.vision_status.config(text="Vision: starting...", fg=YELLOW)
+            except Exception as e:
+                messagebox.showerror("Vision Error", str(e))
+
+    def _on_source_change(self):
+        """Handle coordinate source radio button change."""
+        self.coord_source = self.coord_var.get()
+
+    def _vision_poll(self):
+        """Poll vision system for pose updates (runs on main thread)."""
+        if self.vision_enabled and self.vision_tracker:
+            x, y, theta, valid = self.vision_tracker.get_pose()
+            self.vision_x = x
+            self.vision_y = y
+            self.vision_theta = theta
+            self.vision_valid = valid
+
+            status = self.vision_tracker.get_status()
+            cal = "CAL" if status.get('calibrated', False) else "NO CAL"
+            fps = status.get('fps', 0)
+            anchors = sum(1 for v in status.get('anchors', {}).values() if v)
+            pose_str = ""
+            if valid:
+                pose_str = f"\n  x={x:.3f} y={y:.3f} th={math.degrees(theta):.0f}deg"
+
+            self.vision_status.config(
+                text=f"Vision: {cal} | {fps:.0f} FPS | {anchors}/4 anchors{pose_str}",
+                fg=GREEN if valid else ORANGE)
+
+        self.root.after(100, self._vision_poll)
 
 
 # ------------------------------------------------------------------
